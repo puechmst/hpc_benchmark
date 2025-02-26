@@ -5,6 +5,7 @@
 #include <iostream>
 #include <fstream>
 #include <random>
+#include <type_traits>
 
 __device__ const float A11 = 1.0f / 4.0f;
 __device__ const float A21 = 3.0f / 32.0f;
@@ -58,51 +59,68 @@ __device__ const float C6 = 1.0f / 2.0f;
 //         yp[i] = 1.0f + y[i] * y[i];
 // }
 
-struct my_test {
+struct ode_def {
+     __device__ virtual void operator()(float t, float *y, float *yp) = 0;
+     __device__ virtual float getTol() = 0;
+};
+
+struct my_test: public ode_def {
+    const float tol = 1e-5;
     __device__ void operator()(float t, float *y, float *yp) {
         for (int i = 0; i < STATE_DIM; i++)
             yp[i] = 1.0f + y[i] * y[i];
     }
+
+    __device__ float getTol() { return tol; }
 };
 
 template<class T>
+concept OdeObject = std::is_base_of<ode_def, T>::value;
+
+template<OdeObject T>
 __global__ 
-void rk45(T ode, float t, float *y, float *err, float step)
+void rk45(T ode, float t, float *y, float *err, float *step)
 {
     // arrays are normally stored in registers unless STATE_DIM is too large
     // the -Xptvas -v option in CmakeLists.txt dumps true usage.
     float yy[STATE_DIM], cur[STATE_DIM], k1[STATE_DIM], k2[STATE_DIM], k3[STATE_DIM], k4[STATE_DIM], k5[STATE_DIM], k6[STATE_DIM];
     float e;
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * STATE_DIM;
+    float h;
+    int ide = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = ide * STATE_DIM;
     // load local data
+    h = step[ide];
     for (int i = 0; i < STATE_DIM; i++)
         yy[i] = y[idx + i];
     ode(t, yy, k1);
     for (int i = 0; i < STATE_DIM; i++)
-        cur[i] = yy[i] + step * A11 * k1[i];
-    ode(t + step * C2, cur, k2);
+        cur[i] = yy[i] + h * A11 * k1[i];
+    ode(t + h * C2, cur, k2);
     for (int i = 0; i < STATE_DIM; i++)
-        cur[i] = yy[i] + step * (A21 * k1[i] + A22 * k2[i]);
-    ode(t + step * C3, cur, k3);
+        cur[i] = yy[i] + h * (A21 * k1[i] + A22 * k2[i]);
+    ode(t + h * C3, cur, k3);
     for (int i = 0; i < STATE_DIM; i++)
-        cur[i] = yy[i] + step * (A31 * k1[i] + A32 * k2[i] + A33 * k3[i]);
-    ode(t + step * C4, cur, k4);
+        cur[i] = yy[i] + h * (A31 * k1[i] + A32 * k2[i] + A33 * k3[i]);
+    ode(t + h * C4, cur, k4);
     for (int i = 0; i < STATE_DIM; i++)
-        cur[i] = yy[i] + step * (A41 * k1[i] + A42 * k2[i] + A43 * k3[i] + A44 * k4[i]);
-    ode(t + step * C5, cur, k5);
+        cur[i] = yy[i] + h * (A41 * k1[i] + A42 * k2[i] + A43 * k3[i] + A44 * k4[i]);
+    ode(t + h * C5, cur, k5);
     for (int i = 0; i < STATE_DIM; i++)
-        cur[i] = yy[i] + step * (A51 * k1[i] + A52 * k2[i] + A53 * k3[i] + A54 * k4[i] + A55 * k5[i]);
-    ode(t + step * C6, cur, k6);
+        cur[i] = yy[i] + h * (A51 * k1[i] + A52 * k2[i] + A53 * k3[i] + A54 * k4[i] + A55 * k5[i]);
+    ode(t + h * C6, cur, k6);
     // get new state and estimate error
     e = 0.0;
     for (int i = 0; i < STATE_DIM; i++)
     {
         // It is tempting to use the higher order approximation, but the predicted error is computed for the lower one,
-        // and so is the optimal step.
-        y[i + idx] = yy[i] + step * (B11 * k1[i] + B12 * k2[i] + B13 * k3[i] + B14 * k4[i] + B15 * k5[i]);
-        e += step * fabs((B11 - B21) * k1[i] + (B12 - B22) * k2[i] + (B13 - B23) * k3[i] + (B14 - B24) * k4[i] + (B15 - B25) * k5[i] - B26 * k6[i]);
+        // and so is the optimal h.
+        y[i + idx] = yy[i] + h * (B11 * k1[i] + B12 * k2[i] + B13 * k3[i] + B14 * k4[i] + B15 * k5[i]);
+        e += h * fabs((B11 - B21) * k1[i] + (B12 - B22) * k2[i] + (B13 - B23) * k3[i] + (B14 - B24) * k4[i] + (B15 - B25) * k5[i] - B26 * k6[i]);
     }
-    err[blockIdx.x * blockDim.x + threadIdx.x] = e;
+    // save error
+    err[ide] = e;
+    // save optimal step for tolerance
+    step[ide] =  h * 0.84 * pow( (float)STATE_DIM * ode.getTol() / e , 0.25f);
 }
 
 void dump_properties(std::ofstream &of) {
@@ -124,15 +142,16 @@ void dump_properties(std::ofstream &of) {
 
 int main(int argc, char *argv[])
 {
-    float *y, *err, *ys;
-    float *dy, *derr;
-    float step = 0.1;
+    float *y, *err, *ys, *istep, *step;
+    float *dy, *derr, *dstep;
     std::mt19937 gen;
     std::uniform_real_distribution<float> dis(0, 0.1);
     int nb = (NEQ + BSIZE - 1) / BSIZE;
     y = new float[NEQ * STATE_DIM];
     ys = new float[NEQ * STATE_DIM];
     err = new float[NEQ];
+    step = new float[NEQ];
+    istep = new float[NEQ];
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -148,19 +167,25 @@ int main(int argc, char *argv[])
     {
         for (int j = 0; j < STATE_DIM; j++)
             y[i * STATE_DIM + j] = dis(gen);
+        step[i] = 0.003;
+        istep[i] = step[i];
     }
     cudaMalloc(&dy, NEQ * STATE_DIM * sizeof(float));
     cudaMalloc(&derr, NEQ * sizeof(float));
+    cudaMalloc(&dstep, NEQ * sizeof(float));
     // copy to device
     cudaMemcpy(dy, y, NEQ * STATE_DIM * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dstep, step, NEQ * sizeof(float), cudaMemcpyHostToDevice);
     // linear grid
     cudaEventRecord(start);
-    rk45<<<nb, BSIZE>>>(my_test(), 0.0, dy, derr, step);
+    rk45<<<nb, BSIZE>>>(my_test(), 0.0, dy, derr, dstep);
     cudaEventRecord(stop);
     //cudaDeviceSynchronize();
     cudaMemcpy(ys, dy, sizeof(float) * NEQ * STATE_DIM, cudaMemcpyDeviceToHost);
     cudaMemcpy(err, derr, sizeof(float) * NEQ, cudaMemcpyDeviceToHost);
+    cudaMemcpy(step, dstep, sizeof(float) * NEQ, cudaMemcpyDeviceToHost);
     cudaEventSynchronize(stop);
+    cudaFree(dstep);
     cudaFree(derr);
     cudaFree(dy);
     float millis=0;
@@ -174,10 +199,11 @@ int main(int argc, char *argv[])
     float max_pred_err = 0.0;
     for (int i = 0; i < NEQ; i++)
     {
+        std::cout << step[i] << std::endl;
         te = 0.0;
         for (int j = 0; j < STATE_DIM; j++)
         {
-            yt = tan(step + atan(y[i * STATE_DIM + j]));
+            yt = tan(istep[i] + atan(y[i * STATE_DIM + j]));
             te += abs(yt - ys[i * STATE_DIM + j]);
            
         }
@@ -189,6 +215,8 @@ int main(int argc, char *argv[])
     std::cout << "max error: " << max_err << " max predicted error: " << max_pred_err << std::endl;
     delete[] y;
     delete[] err;
+    delete[] step;
+    delete[] istep;
     res_file.close();
     return 0;
 }
