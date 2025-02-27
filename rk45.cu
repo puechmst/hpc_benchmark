@@ -2,9 +2,11 @@
 #include <device_launch_parameters.h>
 #include <math.h>
 #include <cuda.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/random.h>
 #include <iostream>
 #include <fstream>
-#include <random>
 #include <type_traits>
 
 __device__ const float A11 = 1.0f / 4.0f;
@@ -142,16 +144,20 @@ void dump_properties(std::ofstream &of) {
 
 int main(int argc, char *argv[])
 {
-    float *y, *err, *ys, *istep, *step;
     float *dy, *derr, *dstep;
-    std::mt19937 gen;
-    std::uniform_real_distribution<float> dis(0, 0.1);
+    thrust::host_vector<float> y(NEQ * STATE_DIM);
+    thrust::host_vector<float> ys(NEQ * STATE_DIM);
+    thrust::host_vector<float> err(NEQ);
+    thrust::host_vector<float> step(NEQ);
+    thrust::host_vector<float> istep(NEQ);
+    thrust::device_vector<float> dvy(NEQ * STATE_DIM);
+    thrust::device_vector<float> dverr(NEQ);
+    thrust::device_vector<float> dvstep(NEQ);
+    thrust::uniform_real_distribution<float> dist(0,0.1);
+    thrust::default_random_engine rng(1234);
+
     int nb = (NEQ + BSIZE - 1) / BSIZE;
-    y = new float[NEQ * STATE_DIM];
-    ys = new float[NEQ * STATE_DIM];
-    err = new float[NEQ];
-    step = new float[NEQ];
-    istep = new float[NEQ];
+ 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -162,32 +168,23 @@ int main(int argc, char *argv[])
     res_file << "neq : " << NEQ << std::endl;
     res_file << "dim : " << STATE_DIM << std::endl;
     res_file << "nb : " << nb << std::endl;
-    // populate state randomly and init error
-    for (int i = 0; i < NEQ; i++)
-    {
-        for (int j = 0; j < STATE_DIM; j++)
-            y[i * STATE_DIM + j] = dis(gen);
-        step[i] = 0.003;
-        istep[i] = step[i];
-    }
-    cudaMalloc(&dy, NEQ * STATE_DIM * sizeof(float));
-    cudaMalloc(&derr, NEQ * sizeof(float));
-    cudaMalloc(&dstep, NEQ * sizeof(float));
-    // copy to device
-    cudaMemcpy(dy, y, NEQ * STATE_DIM * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dstep, step, NEQ * sizeof(float), cudaMemcpyHostToDevice);
-    // linear grid
+    // populate state randomly
+    thrust::generate(y.begin(),y.end(),[&] { return dist(rng);});
+    // save state
+    ys = y;
+    // set step
+    thrust::fill(step.begin(), step.end(), 1e-2);
+    dvstep = step;
+    istep = step;
+    // copy state to device
+    dvy = y;
+    dy = thrust::raw_pointer_cast(&dvy[0]);
+    derr = thrust::raw_pointer_cast(&dverr[0]);
+    dstep = thrust::raw_pointer_cast(&dvstep[0]);
     cudaEventRecord(start);
     rk45<<<nb, BSIZE>>>(my_test(), 0.0, dy, derr, dstep);
     cudaEventRecord(stop);
-    //cudaDeviceSynchronize();
-    cudaMemcpy(ys, dy, sizeof(float) * NEQ * STATE_DIM, cudaMemcpyDeviceToHost);
-    cudaMemcpy(err, derr, sizeof(float) * NEQ, cudaMemcpyDeviceToHost);
-    cudaMemcpy(step, dstep, sizeof(float) * NEQ, cudaMemcpyDeviceToHost);
     cudaEventSynchronize(stop);
-    cudaFree(dstep);
-    cudaFree(derr);
-    cudaFree(dy);
     float millis=0;
     cudaEventElapsedTime(&millis, start, stop);
     cudaEventDestroy(start);
@@ -197,14 +194,18 @@ int main(int argc, char *argv[])
     float te;
     float max_err = 0.0;
     float max_pred_err = 0.0;
+    // copy back from device
+    step = dvstep;
+    y = dvy;
+    err = dverr;
     for (int i = 0; i < NEQ; i++)
     {
         std::cout << step[i] << std::endl;
         te = 0.0;
         for (int j = 0; j < STATE_DIM; j++)
         {
-            yt = tan(istep[i] + atan(y[i * STATE_DIM + j]));
-            te += abs(yt - ys[i * STATE_DIM + j]);
+            yt = tan(istep[i] + atan(ys[i * STATE_DIM + j]));
+            te += abs(yt - y[i * STATE_DIM + j]);
            
         }
         if (te > max_err)
@@ -213,10 +214,6 @@ int main(int argc, char *argv[])
             max_pred_err = abs(err[i]);
     }
     std::cout << "max error: " << max_err << " max predicted error: " << max_pred_err << std::endl;
-    delete[] y;
-    delete[] err;
-    delete[] step;
-    delete[] istep;
     res_file.close();
     return 0;
 }
