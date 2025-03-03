@@ -5,6 +5,7 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 #include <thrust/random.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <iostream>
 #include <fstream>
 #include <type_traits>
@@ -28,7 +29,7 @@ __device__ const float A55 = -11.0f / 40.0f;
 __device__ const float B11 = 25.0f / 216.0f;
 __device__ const float B12 = 0.0f;
 __device__ const float B13 = 1408.0f / 2565.0f;
-__device__ const float B14 = 2197.0f / 4101.0f;
+__device__ const float B14 = 2197.0f / 4104.0f;
 __device__ const float B15 = -1.0f / 5.0f;
 
 __device__ const float B21 = 16.0f / 135.0f;
@@ -50,50 +51,48 @@ __device__ const float C6 = 1.0f / 2.0f;
 
 #define STATE_DIM (10)
 
-#define BSIZE (200)
+#define BSIZE (100)
 #define NEQ (1000 * BSIZE)
 
-
-// __device__ void sysdyn(float t, float *y, float *yp)
-// {
-//     // solution: y = tan(t)
-//     for (int i = 0; i < STATE_DIM; i++)
-//         yp[i] = 1.0f + y[i] * y[i];
-// }
-
-struct ode_def {
-     __device__ virtual void operator()(float t, float *y, float *yp) = 0;
-     __device__ virtual float getTol() = 0;
+struct ode_def
+{
+    __device__ virtual void operator()(float t, float *y, float *yp) = 0;
+    __device__ __host__ virtual float getATol() = 0;
+    __device__ __host__ virtual float getRTol() = 0;
 };
 
-struct my_test: public ode_def {
-    const float tol = 1e-5;
-    __device__ void operator()(float t, float *y, float *yp) {
+struct my_test : public ode_def
+{
+    const float atol = 1e-5;
+    const float rtol = 1e-2;
+    __device__ void operator()(float t, float *y, float *yp)
+    {
         for (int i = 0; i < STATE_DIM; i++)
             yp[i] = 1.0f + y[i] * y[i];
     }
 
-    __device__ float getTol() { return tol; }
+    __device__ __host__ float getATol() { return atol; }
+    __device__ __host__ float getRTol() { return rtol; }
 };
 
-template<class T>
+template <class T>
 concept OdeObject = std::is_base_of<ode_def, T>::value;
 
-template<OdeObject T>
-__global__ 
-void rk45(T ode, float t, float *y, float *err, float *step)
+template <OdeObject T>
+__global__ void rk45(T ode, float *time, float *y4, float *y5, float *step)
 {
     // arrays are normally stored in registers unless STATE_DIM is too large
     // the -Xptvas -v option in CmakeLists.txt dumps true usage.
+    // please check that no spill memory is used.
     float yy[STATE_DIM], cur[STATE_DIM], k1[STATE_DIM], k2[STATE_DIM], k3[STATE_DIM], k4[STATE_DIM], k5[STATE_DIM], k6[STATE_DIM];
-    float e;
-    float h;
+    float h, t;
     int ide = blockIdx.x * blockDim.x + threadIdx.x;
     int idx = ide * STATE_DIM;
     // load local data
     h = step[ide];
+    t = time[ide];
     for (int i = 0; i < STATE_DIM; i++)
-        yy[i] = y[idx + i];
+        yy[i] = y4[idx + i];
     ode(t, yy, k1);
     for (int i = 0; i < STATE_DIM; i++)
         cur[i] = yy[i] + h * A11 * k1[i];
@@ -110,28 +109,23 @@ void rk45(T ode, float t, float *y, float *err, float *step)
     for (int i = 0; i < STATE_DIM; i++)
         cur[i] = yy[i] + h * (A51 * k1[i] + A52 * k2[i] + A53 * k3[i] + A54 * k4[i] + A55 * k5[i]);
     ode(t + h * C6, cur, k6);
-    // get new state and estimate error
-    e = 0.0;
+    // get new states at order 4 and 5
     for (int i = 0; i < STATE_DIM; i++)
     {
-        // It is tempting to use the higher order approximation, but the predicted error is computed for the lower one,
-        // and so is the optimal h.
-        y[i + idx] = yy[i] + h * (B11 * k1[i] + B12 * k2[i] + B13 * k3[i] + B14 * k4[i] + B15 * k5[i]);
-        e += h * fabs((B11 - B21) * k1[i] + (B12 - B22) * k2[i] + (B13 - B23) * k3[i] + (B14 - B24) * k4[i] + (B15 - B25) * k5[i] - B26 * k6[i]);
+        y4[i + idx] = yy[i] + h * (B11 * k1[i] + B12 * k2[i] + B13 * k3[i] + B14 * k4[i] + B15 * k5[i]);
+        y5[i + idx] = yy[i] + h * (B21 * k1[i] + B22 * k2[i] + B23 * k3[i] + B24 * k4[i] + B25 * k5[i] + B26 * k6[i]);
     }
-    // save error
-    err[ide] = e;
-    // save optimal step for tolerance
-    step[ide] =  h * 0.84 * pow( (float)STATE_DIM * ode.getTol() / e , 0.25f);
 }
 
-void dump_properties(std::ofstream &of) {
+void dump_properties(std::ofstream &of)
+{
     // enumerare devices
     int ndevices;
     cudaDeviceProp prop;
     cudaGetDeviceCount(&ndevices);
-    for(int i = 0 ; i < ndevices ; i++) {
-        of << "Device " << i <<  ":" << std::endl;
+    for (int i = 0; i < ndevices; i++)
+    {
+        of << "Device " << i << ":" << std::endl;
         cudaGetDeviceProperties(&prop, i);
         of << "name : " << prop.name << std::endl;
         of << "arch : " << prop.major << "." << prop.minor << std::endl;
@@ -144,20 +138,23 @@ void dump_properties(std::ofstream &of) {
 
 int main(int argc, char *argv[])
 {
-    float *dy, *derr, *dstep;
+    float *dy4, *dy5, *dtime, *dstep;
+    my_test ode;
+    thrust::host_vector<float> t(NEQ);
+    thrust::host_vector<float> tf(NEQ);
     thrust::host_vector<float> y(NEQ * STATE_DIM);
+    thrust::host_vector<float> y5(NEQ * STATE_DIM);
     thrust::host_vector<float> ys(NEQ * STATE_DIM);
-    thrust::host_vector<float> err(NEQ);
     thrust::host_vector<float> step(NEQ);
-    thrust::host_vector<float> istep(NEQ);
-    thrust::device_vector<float> dvy(NEQ * STATE_DIM);
-    thrust::device_vector<float> dverr(NEQ);
+    thrust::device_vector<float> dvt(NEQ);
+    thrust::device_vector<float> dvy4(NEQ * STATE_DIM);
+    thrust::device_vector<float> dvy5(NEQ * STATE_DIM);
     thrust::device_vector<float> dvstep(NEQ);
-    thrust::uniform_real_distribution<float> dist(0,0.1);
+    thrust::uniform_real_distribution<float> dist(0, 0.1);
     thrust::default_random_engine rng(1234);
 
     int nb = (NEQ + BSIZE - 1) / BSIZE;
- 
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -169,51 +166,76 @@ int main(int argc, char *argv[])
     res_file << "dim : " << STATE_DIM << std::endl;
     res_file << "nb : " << nb << std::endl;
     // populate state randomly
-    thrust::generate(y.begin(),y.end(),[&] { return dist(rng);});
+    thrust::generate(y.begin(), y.end(), [&]
+                     { return dist(rng); });
     // save state
     ys = y;
-    // set step
+    // set time, final time and step
+    thrust::fill(t.begin(), t.end(), 0.0);
+    thrust::fill(tf.begin(), tf.end(), 10.0);
     thrust::fill(step.begin(), step.end(), 1e-2);
-    dvstep = step;
-    istep = step;
-    // copy state to device
-    dvy = y;
-    dy = thrust::raw_pointer_cast(&dvy[0]);
-    derr = thrust::raw_pointer_cast(&dverr[0]);
-    dstep = thrust::raw_pointer_cast(&dvstep[0]);
-    cudaEventRecord(start);
-    rk45<<<nb, BSIZE>>>(my_test(), 0.0, dy, derr, dstep);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float millis=0;
-    cudaEventElapsedTime(&millis, start, stop);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    res_file << "Elapsed : " << millis << std::endl;
-    float yt;
-    float te;
-    float max_err = 0.0;
-    float max_pred_err = 0.0;
-    // copy back from device
-    step = dvstep;
-    y = dvy;
-    err = dverr;
-    for (int i = 0; i < NEQ; i++)
+
+    // iterate until final time is reached
+    bool is_finished = false;
+    float tpe;
+    float err_level, err_estimate;
+    float s;
+    int nstates = 0;
+    while (nstates < 100 * NEQ)
     {
-        std::cout << step[i] << std::endl;
-        te = 0.0;
-        for (int j = 0; j < STATE_DIM; j++)
+        // copy state to device
+        dvstep = step;
+        dvy4 = ys;
+        dvt = t;
+        dy4 = thrust::raw_pointer_cast(&dvy4[0]);
+        dy5 = thrust::raw_pointer_cast(&dvy5[0]);
+        dstep = thrust::raw_pointer_cast(&dvstep[0]);
+        dtime = thrust::raw_pointer_cast(&dvt[0]);
+        rk45<<<nb, BSIZE>>>(ode, dtime, dy4, dy5, dstep);
+        cudaDeviceSynchronize();
+        // copy back from device
+        y = dvy4;
+        y5 = dvy5;
+        for (int i = 0; i < NEQ; i++)
         {
-            yt = tan(istep[i] + atan(ys[i * STATE_DIM + j]));
-            te += abs(yt - y[i * STATE_DIM + j]);
-           
+            // check for termination
+            if (t[i] >= tf[i])
+            {
+                // regenerate new state
+
+                thrust::generate(&y[i * STATE_DIM], &y[(i + 1) * STATE_DIM] - 1, [&]
+                                 { return dist(rng); });
+                t[i] = 0.0;
+                nstates++;
+            }
+            // error estimation
+            tpe = 0.0;
+            for (int j = 0; j < STATE_DIM; j++)
+            {
+                err_level = ode.getATol() + ode.getRTol() * y[i * STATE_DIM + j];
+                err_estimate = abs(y[i * STATE_DIM + j] - y5[i * STATE_DIM + j]);
+                tpe = max(tpe, err_estimate / err_level);
+            }
+            if (tpe >= 1.1)
+            {
+                // reduce step
+                s = max(0.2f, 0.9 * pow(tpe, -0.25f));
+            }
+            else
+            {
+                // accept new state
+
+                for (int j = 0; j < STATE_DIM; j++)
+                    ys[i * STATE_DIM + j] = y[i * STATE_DIM + j];
+                t[i] += step[i];
+                // increase step
+                s = min(5.0f, 0.9 * pow(tpe, -0.20f));
+            }
+            s *= step[i];
+            step[i] = min(s, tf[i] - step[i]);
         }
-        if (te > max_err)
-                max_err = te;
-        if (abs(err[i]) > max_pred_err)
-            max_pred_err = abs(err[i]);
     }
-    std::cout << "max error: " << max_err << " max predicted error: " << max_pred_err << std::endl;
+
     res_file.close();
     return 0;
 }
