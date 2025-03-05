@@ -6,6 +6,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/random.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <texture_types.h>
 #include <iostream>
 #include <fstream>
 #include <type_traits>
@@ -65,10 +66,13 @@ struct my_test : public ode_def
 {
     const float atol = 1e-5;
     const float rtol = 1e-2;
+    cudaTextureObject_t tex;
     __device__ void operator()(float t, float *y, float *yp)
     {
+        float4 wd = tex3D<float4>(tex, 0.1, 0.1, 0.1);
+     
         for (int i = 0; i < STATE_DIM; i++)
-            yp[i] = 1.0f + y[i] * y[i];
+            yp[i] = 1.0f + y[i] * y[i] + 0.01 * wd.y;
     }
 
     __device__ __host__ float getATol() { return atol; }
@@ -130,34 +134,124 @@ void dump_properties(std::ofstream &of)
         of << "name : " << prop.name << std::endl;
         of << "arch : " << prop.major << "." << prop.minor << std::endl;
         of << "global memory : " << prop.totalGlobalMem << std::endl;
+        of << "Texture size: " << prop.maxTexture3D[0] << "x" << prop.maxTexture3D[1] << "x" << prop.maxTexture3D[1] << std::endl;
         of << "shared memory (per block) : " << prop.sharedMemPerBlock << std::endl;
         of << "registers (per block) : " << prop.regsPerBlock << std::endl;
         of << "registers (per mp) : " << prop.regsPerMultiprocessor << std::endl;
     }
 }
 
+/**
+ * @brief This function generates a synthetic weather grid with the format of ERA5 data
+ * 
+ * @param dst 
+ * @param nlon 
+ * @param nlat 
+ * @param nlevel 
+ */
+void generateWeatherData(float4 *dst, int nlon, int nlat, int nlevel) {
+    int idx = 0;
+    float lat, lon, h, p;
+    // the wind has a negative gradient, going to zero at the poles
+    for(int ih = 0 ; ih < nlevel ; ih++) {
+        for(int ilat = 0 ; ilat < nlat ; ilat++) {
+            // wind is constant in altitude
+            // temperature is ISA
+            for(int ilon = 0 ; ilon < nlon ; ilon++) {
+                lat = (float)(ilat-nlat/2) * 0.25; 
+                lon = (float)(ilon-nlon/2) * 0.25;
+                p = 1000.0f - (float)ih * 50.0f;
+                // barometric equation
+                h = 44307 * (1 - pow(p/1013, 0.19));
+                // temperature in kelvins
+                dst[idx].x = 288 - 0.006 * h;
+                // east component of wind
+                dst[idx].y = 50.0f * (1 - abs(lat)/ 90.0f);
+                // north component of wind
+                dst[idx].z = 0.0f;
+                // geoaltitude
+                dst[idx++].w = h;
+            }
+        }
+    }
+}
+
+
 int main(int argc, char *argv[])
 {
+    // device raw pointers
     float *dy4, *dy5, *dtime, *dstep;
+    cudaTextureObject_t weatherTex;
+    // format is altitude, temperature, vx, vy, hence 4 floats
+    cudaChannelFormatDesc weatherDesc = cudaCreateChannelDesc<float4>();
+    cudaArray *weatherArray;
+    float4 *syntheticWeather;
+    cudaError_t err;
+
+    // weather grid has 0.25° resolution
+    constexpr int nlat = 4 * 180;
+    constexpr int nlon = 4 * 360;
+    // number of pressure levels
+    constexpr int nlevel = 17;
+    // create device array
+    cudaMalloc3DArray(&weatherArray, &weatherDesc, make_cudaExtent(nlon, nlat, nlevel));
+    // create host array 
+    syntheticWeather = new float4[nlat * nlon * nlevel ];
+    generateWeatherData(syntheticWeather, nlon, nlat, nlevel);
+    // copy parameters
+    cudaMemcpy3DParms cpyparms = {0};
+    cpyparms.srcPos = make_cudaPos(0,0,0);
+    cpyparms.dstPos = make_cudaPos(0,0,0);
+    cpyparms.srcPtr = make_cudaPitchedPtr(syntheticWeather,  nlon * sizeof(float4), nlon, nlat);
+    cpyparms.dstArray = weatherArray;
+    cpyparms.extent = make_cudaExtent(nlon, nlat, nlevel);
+    cpyparms.kind = cudaMemcpyHostToDevice;
+    // copy array
+    cudaMemcpy3D(&cpyparms);
+    // create texture
+    cudaResourceDesc rd;
+    memset(&rd, 0, sizeof(cudaResourceDesc));
+    rd.resType = cudaResourceTypeArray;
+    rd.res.array.array = weatherArray;
+    cudaTextureDesc td;
+    memset(&td, 0, sizeof(cudaTextureDesc));
+    td.addressMode[0] = cudaAddressModeWrap;
+    td.addressMode[1] = cudaAddressModeWrap;
+    td.addressMode[2] = cudaAddressModeClamp;
+    td.filterMode = cudaFilterModeLinear;
+    td.normalizedCoords = true;
+    cudaCreateTextureObject(&weatherTex, &rd, &td, nullptr);
+    // the problem to be solved
     my_test ode;
+    ode.tex = weatherTex;
+    // current time vector
     thrust::host_vector<float> t(NEQ);
+    // final time vector
     thrust::host_vector<float> tf(NEQ);
+    // low order state
     thrust::host_vector<float> y(NEQ * STATE_DIM);
+    // high order state
     thrust::host_vector<float> y5(NEQ * STATE_DIM);
+    // saved state
     thrust::host_vector<float> ys(NEQ * STATE_DIM);
+    // current steo
     thrust::host_vector<float> step(NEQ);
+    // device current time vector
     thrust::device_vector<float> dvt(NEQ);
+    // device low order state
     thrust::device_vector<float> dvy4(NEQ * STATE_DIM);
+    // device high order state
     thrust::device_vector<float> dvy5(NEQ * STATE_DIM);
+    // device step
     thrust::device_vector<float> dvstep(NEQ);
+    // random number generator stuff
     thrust::uniform_real_distribution<float> dist(0, 0.1);
     thrust::default_random_engine rng(1234);
 
+    // number of blocks
     int nb = (NEQ + BSIZE - 1) / BSIZE;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+
     // file for saving results
     std::ofstream res_file("res.txt");
     // dump capabilities
@@ -176,17 +270,17 @@ int main(int argc, char *argv[])
     thrust::fill(step.begin(), step.end(), 1e-2);
 
     // iterate until final time is reached
-    bool is_finished = false;
     float tpe;
     float err_level, err_estimate;
     float s;
     int nstates = 0;
-    while (nstates < 100 * NEQ)
+    while (nstates < 10 * NEQ)
     {
         // copy state to device
         dvstep = step;
         dvy4 = ys;
         dvt = t;
+        // convert thrust vectors to device pointers
         dy4 = thrust::raw_pointer_cast(&dvy4[0]);
         dy5 = thrust::raw_pointer_cast(&dvy5[0]);
         dstep = thrust::raw_pointer_cast(&dvstep[0]);
@@ -235,7 +329,8 @@ int main(int argc, char *argv[])
             step[i] = min(s, tf[i] - step[i]);
         }
     }
-
+    cudaDestroyTextureObject(weatherTex);
+    cudaFreeArray(weatherArray);
     res_file.close();
     return 0;
 }
