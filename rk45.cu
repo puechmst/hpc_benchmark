@@ -10,6 +10,7 @@
 #include <iostream>
 #include <fstream>
 #include <type_traits>
+#include "quaternion.cuh"
 
 __device__ const float A11 = 1.0f / 4.0f;
 __device__ const float A21 = 3.0f / 32.0f;
@@ -55,6 +56,7 @@ __device__ const float C6 = 1.0f / 2.0f;
 #define BSIZE (100)
 #define NEQ (1000 * BSIZE)
 
+// interface for an ODE problem
 struct ode_def
 {
     __device__ virtual void operator()(float t, float *y, float *yp) = 0;
@@ -62,6 +64,7 @@ struct ode_def
     __device__ __host__ virtual float getRTol() = 0;
 };
 
+// the dynamic equation of a UAV
 struct my_test : public ode_def
 {
     const float atol = 1e-5;
@@ -75,8 +78,8 @@ struct my_test : public ode_def
             yp[i] = 1.0f + y[i] * y[i] + 0.01 * wd.y;
     }
 
-    __device__ __host__ float getATol() { return atol; }
-    __device__ __host__ float getRTol() { return rtol; }
+    __device__ __host__ constexpr float getATol() { return atol; }
+    __device__ __host__ constexpr float getRTol() { return rtol; }
 };
 
 template <class T>
@@ -179,6 +182,7 @@ void generateWeatherData(float4 *dst, int nlon, int nlat, int nlevel) {
 
 int main(int argc, char *argv[])
 {
+
     // device raw pointers
     float *dy4, *dy5, *dtime, *dstep;
     cudaTextureObject_t weatherTex;
