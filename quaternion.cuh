@@ -2,6 +2,8 @@
 #include <math.h>
 #include <type_traits>
 
+#ifndef _QUATERNION_H
+#define QUATERNION_H
 namespace numeric
 {
     template <typename T>
@@ -26,13 +28,16 @@ namespace numeric
 
         __host__ __device__ T real() { return q.w;}
         __host__ __device__ vec3 imag() { return vec3(q.x,q.y,q.z);}
+        __host__ __device__ float getX() { return q.x;}
+        __host__ __device__ float getY() { return q.y;}
+        __host__ __device__ float getZ() { return q.z;}
 
-        __host__ __device__ T normSq()
+        __host__ __device__ T normSq() const
         {
             return q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
         }
 
-        __host__ __device__ T norm()
+        __host__ __device__ T norm() const
         {
             return sqrt(normSq());
         }
@@ -161,7 +166,7 @@ namespace numeric
             return Quaternion(c, w.x * s, w.y * s, w.z * s);
         }
 
-        __host__ __device__ static Quaternion exp(Quaternion &op)
+        __host__ __device__ static Quaternion exp(const Quaternion &op)
         {
             T nv = sqrt(op.q.x * op.q.x + op.q.y * op.q.y + op.q.z * op.q.z);
             T t = (nv == 0) ? 0.0 : sin(nv) / nv;
@@ -169,7 +174,7 @@ namespace numeric
             return Quaternion(a * cos(nv), a * t * op.q.x, a * t * op.q.y , a * t * op.q.z );
         }
 
-        __host__ __device__ static Quaternion log(Quaternion &op)
+        __host__ __device__ static Quaternion log(const Quaternion &op)
         {
             T n = op.norm();
             T nv;
@@ -187,3 +192,4 @@ namespace numeric
     };
 
 };
+#endif
