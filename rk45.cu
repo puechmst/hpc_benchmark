@@ -10,9 +10,11 @@
 #include <iostream>
 #include <fstream>
 #include <type_traits>
+#include <chrono>
 #include "rk45.cuh"
 #include "uav.cuh"
 
+using namespace std::chrono;
 
 // the dimension of the state space must be small enough to fit into local registers (255).
 // static definition allows the compiler to unroll loops
@@ -21,7 +23,7 @@
 #define STATE_DIM (12)
 
 #define BSIZE (100)
-#define NEQ (10000 * BSIZE)
+#define NEQ (40000 * BSIZE)
 
 
 // the dynamic equation of a UAV
@@ -76,7 +78,7 @@ void dump_properties(std::ofstream &of)
  */
 void generateWeatherData(float4 *dst, int nlon, int nlat, int nlevel) {
     int idx = 0;
-    float lat, lon, h, p;
+    float lat,  h, p;
     // the wind has a negative gradient, going to zero at the poles
     for(int ih = 0 ; ih < nlevel ; ih++) {
         for(int ilat = 0 ; ilat < nlat ; ilat++) {
@@ -84,7 +86,6 @@ void generateWeatherData(float4 *dst, int nlon, int nlat, int nlevel) {
             // temperature is ISA
             for(int ilon = 0 ; ilon < nlon ; ilon++) {
                 lat = (float)(ilat-nlat/2) * 0.25; 
-                lon = (float)(ilon-nlon/2) * 0.25;
                 p = 1000.0f - (float)ih * 50.0f;
                 // barometric equation
                 h = 44307 * (1 - pow(p/1013, 0.19));
@@ -112,7 +113,6 @@ int main(int argc, char *argv[])
     cudaChannelFormatDesc weatherDesc = cudaCreateChannelDesc<float4>();
     cudaArray *weatherArray;
     float4 *syntheticWeather;
-    cudaError_t err;
 
     // weather grid has 0.25° resolution
     constexpr int nlat = 4 * 180;
@@ -207,6 +207,7 @@ int main(int argc, char *argv[])
     float err_level, err_estimate;
     float s;
     int nstates = 0;
+    auto start = high_resolution_clock::now();
     while (nstates < 10 * NEQ)
     {
         // copy state to device
@@ -262,6 +263,9 @@ int main(int argc, char *argv[])
             step[i] = min(s, tf[i] - step[i]);
         }
     }
+    auto end = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(end-start);
+    res_file << "Elpased time : " << duration.count() << " ms." << std::endl;
     cudaDestroyTextureObject(weatherTex);
     cudaFreeArray(weatherArray);
     res_file.close();

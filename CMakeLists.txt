@@ -6,7 +6,7 @@ add_executable(simu rk45.cu quaternion.cuh uav.cuh ode.cuh)
 set_property(TARGET simu PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 set_property(TARGET simu PROPERTY CXX_STANDARD 20)
 target_compile_options(simu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-                       --relocatable-device-code=true
+                       -std=c++20
                        -cudadevrt static
                         -Xptxas -v 
                        >)

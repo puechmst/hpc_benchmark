@@ -66,9 +66,9 @@ struct uav_dynamics : public ode_def
         cmd.y = -attitude_gain * err_attitude.getY() -attitude_gain * y[OMEGA2];
         cmd.z = -attitude_gain * err_attitude.getZ() - attitude_gain * y[OMEGA3];
         // apply command
-        y[OMEGA1] = cmd.x * inertia.x;
-        y[OMEGA2] = cmd.y * inertia.y;
-        y[OMEGA3] = cmd.z * inertia.z;
+        yp[OMEGA1] = cmd.x * inertia.x;
+        yp[OMEGA2] = cmd.y * inertia.y;
+        yp[OMEGA3] = cmd.z * inertia.z;
         float r = length(make_float3(y[R0],y[R1],y[R2]));
         float fac = 1.0 - M_PI / r;
         if (r >= M_PI) {
@@ -108,9 +108,6 @@ struct uav_dynamics : public ode_def
         yp[R0] = ro1;
         yp[R1] = ro2;
         yp[R2] = ro3;
-        y[R0] = r1;
-        y[R1] = r1;
-        y[R2] = r2;
         Quaternion<float> attitude = Quaternion<float>::exp(Quaternion<float>(0.0, r1, r2, r3));
           // compute total force in earth frame
           r1 = f * 2.0 * (attitude.getX() * attitude.getZ() - attitude.real() * attitude.getY());
